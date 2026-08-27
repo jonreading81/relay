@@ -33,6 +33,7 @@ import type {
   OptimisticUpdate,
   PublishQueue,
   Record,
+  RecordSource,
   RelayResponsePayload,
   RequestDescriptor,
   SelectorStoreUpdater,
@@ -138,6 +139,7 @@ class Executor<TMutation extends MutationParameters> {
   _getDataID: GetDataID;
   _treatMissingFieldsAsNull: boolean;
   _deferDeduplicatedFields: boolean;
+  _pendingBatchSources: ?Array<RecordSource>;
   _incrementalPayloadsPending: boolean;
   _incrementalResults: Map<Label, Map<PathKey, IncrementalResults>>;
   _log: LogFunction;
@@ -576,6 +578,10 @@ class Executor<TMutation extends MutationParameters> {
       return;
     }
     this._seenActors.clear();
+    // Collect the sources normalized during this call so later payloads in
+    // the same publish can resolve record identity against them — see
+    // `_getBatchSource`.
+    this._pendingBatchSources = [];
 
     const responses = Array.isArray(response) ? response : [response];
     const responsesWithData = this._handleErrorResponse(responses);
@@ -731,6 +737,8 @@ class Executor<TMutation extends MutationParameters> {
         ? this._operation
         : undefined,
     );
+
+    this._pendingBatchSources = null;
 
     if (hasNonIncrementalResponses) {
       if (this._incrementalPayloadsPending) {
@@ -980,6 +988,7 @@ class Executor<TMutation extends MutationParameters> {
         relayPayload,
         this._updater,
       );
+      this._stageBatchSource(relayPayload);
       this._log({
         name: 'execute.normalize.end',
         operation: this._operation,
@@ -1237,6 +1246,7 @@ class Executor<TMutation extends MutationParameters> {
       this._operation,
       relayPayload,
     );
+    this._stageBatchSource(relayPayload);
     this._processPayloadFollowups([relayPayload]);
   }
 
@@ -1263,11 +1273,10 @@ class Executor<TMutation extends MutationParameters> {
       resultForLabel = new Map();
       this._incrementalResults.set(label, resultForLabel);
     }
-    const resultForPath = resultForLabel.get(pathKey);
-    const pendingResponses =
-      resultForPath != null && resultForPath.kind === 'response'
-        ? resultForPath.responses
-        : null;
+    const pendingResponses = this._takeQueuedResponsesFor(
+      resultForLabel,
+      pathKey,
+    );
     resultForLabel.set(pathKey, {kind: 'placeholder', placeholder});
 
     // If the parent has no data of its own (only inner @defers), the
@@ -1467,6 +1476,10 @@ class Executor<TMutation extends MutationParameters> {
       if (existing != null && existing.kind === 'placeholder') {
         return;
       }
+      const queued = this._takeQueuedResponsesFor(
+        resultForLabel,
+        parentPathKey,
+      );
       const innerPlaceholder = buildInnerDeferPlaceholder(
         parentPlaceholder,
         defer,
@@ -1476,13 +1489,89 @@ class Executor<TMutation extends MutationParameters> {
         placeholder: innerPlaceholder,
       });
       this._registerInnerDeferPlaceholders(innerPlaceholder);
-      if (existing != null && existing.kind === 'response') {
-        const payloadFollowups = this._processIncrementalResponses(
-          existing.responses,
-        );
+      if (queued != null) {
+        const payloadFollowups = this._processIncrementalResponses(queued);
         this._processPayloadFollowups(payloadFollowups);
       }
     });
+  }
+
+  /**
+   * The published store, overlaid with the payload sources already normalized
+   * in the current `_handleNext` call.
+   *
+   * A response delivered as an array is published once, at the end, so a
+   * later payload in the batch cannot see earlier ones through the store.
+   * Identity recovery for a deduplicated @defer chunk depends on seeing them:
+   * the server omits fields an earlier chunk already carried, including the
+   * `id` of a record, so without the overlay normalization synthesises a
+   * client ID and the chunk's fields strand on a record nothing links to.
+   */
+  _getBatchSource(): RecordSource {
+    const base = this._getStore(this._actorIdentifier).getSource();
+    const staged = this._pendingBatchSources;
+    if (staged == null || staged.length === 0) {
+      return base;
+    }
+    const overlaid = (dataID: DataID): ?Record => {
+      let record = base.get(dataID);
+      for (let i = 0; i < staged.length; i++) {
+        const next = staged[i].get(dataID);
+        if (next != null) {
+          record =
+            record == null ? next : RelayModernRecord.update(record, next);
+        }
+      }
+      return record;
+    };
+    // Only `get` reads the overlay; the rest of the interface is the
+    // published store's, which identity recovery does not consult.
+    return {
+      get: overlaid,
+      getRecordIDs: () => base.getRecordIDs(),
+      getStatus: (dataID: DataID) => base.getStatus(dataID),
+      has: (dataID: DataID) => overlaid(dataID) != null || base.has(dataID),
+      size: () => base.size(),
+      toJSON: () => base.toJSON(),
+    };
+  }
+
+  _stageBatchSource(relayPayload: RelayResponsePayload): void {
+    if (this._pendingBatchSources != null) {
+      this._pendingBatchSources.push(relayPayload.source);
+    }
+  }
+
+  /**
+   * Take every queued response this placeholder can serve: the ones at its own
+   * path, and any at a DEEPER path.
+   *
+   * A chunk that arrives before its placeholder is registered is queued under
+   * its own path, which for a sub-path chunk is deeper than the path the
+   * placeholder registers at. Draining only the exact path leaves those queued
+   * forever. A batch publishes a whole @defer stream at once, so every chunk in
+   * it is queued before any placeholder exists.
+   */
+  _takeQueuedResponsesFor(
+    resultForLabel: Map<string, IncrementalResults>,
+    pathKey: string,
+  ): ?Array<IncrementalGraphQLResponse> {
+    const prefix = pathKey === '' ? null : pathKey + '.';
+    const queued: Array<IncrementalGraphQLResponse> = [];
+    const drainedKeys: Array<string> = [];
+    resultForLabel.forEach((entry, key) => {
+      if (entry.kind !== 'response') {
+        return;
+      }
+      if (key === pathKey || prefix == null || key.startsWith(prefix)) {
+        queued.push(...entry.responses);
+        drainedKeys.push(key);
+      }
+    });
+    for (let i = 0; i < drainedKeys.length; i++) {
+      resultForLabel.delete(drainedKeys[i]);
+    }
+    return queued.length > 0 ? queued : null;
   }
 
   _processDeferResponse(
@@ -1504,7 +1593,7 @@ class Executor<TMutation extends MutationParameters> {
             placeholder,
             response,
             activeSubPath,
-            this._getStore(this._actorIdentifier).getSource(),
+            this._getBatchSource(),
           )
         : null;
     if (activeSubPath != null && recovery == null) {
@@ -1538,6 +1627,7 @@ class Executor<TMutation extends MutationParameters> {
       this._operation,
       relayPayload,
     );
+    this._stageBatchSource(relayPayload);
 
     // Load the version of the parent record from which this incremental data
     // was derived
@@ -1601,6 +1691,7 @@ class Executor<TMutation extends MutationParameters> {
       path,
       placeholder.path,
     );
+    this._stageBatchSource(relayPayload);
     // Publish the new item and update the parent record to set
     // field[index] = item *if* the parent record hasn't been concurrently
     // modified.
@@ -1800,11 +1891,17 @@ class Executor<TMutation extends MutationParameters> {
   _updateOperationTracker(
     updatedOwners: ?ReadonlyArray<RequestDescriptor>,
   ): void {
-    if (updatedOwners != null && updatedOwners.length > 0) {
-      this._operationTracker.update(
-        this._operation.request,
-        new Set(updatedOwners),
-      );
+    const owners = new Set(updatedOwners ?? []);
+    // An operation still streaming @defer chunks is pending for its own
+    // readers even when a payload wrote nothing. A query whose every root
+    // selection is deferred has an empty initial payload, and without this the
+    // tracker never learns the operation exists — so reads of the deferred
+    // fragments render missing data instead of suspending.
+    if (this._incrementalPayloadsPending && this._state !== 'completed') {
+      owners.add(this._operation.request);
+    }
+    if (owners.size > 0) {
+      this._operationTracker.update(this._operation.request, owners);
     }
   }
 
@@ -1926,7 +2023,10 @@ function findDeferPlaceholderByPrefix(
   placeholder: IncrementalResults,
   subPath: ReadonlyArray<unknown>,
 } {
-  for (let prefixLen = path.length - 1; prefixLen > 0; prefixLen--) {
+  // prefixLen reaches 0: a fragment deferred at the query root registers
+  // its placeholder at path [] (the empty key), so the walk must include
+  // the empty prefix or root-level chunks never match.
+  for (let prefixLen = path.length - 1; prefixLen >= 0; prefixLen--) {
     const prefixKey = path.slice(0, prefixLen).map(String).join('.');
     const result = resultForLabel.get(prefixKey);
     if (result != null && result.kind === 'placeholder') {
@@ -1951,10 +2051,7 @@ function forEachInnerDefer(
     for (const sel of selections) {
       switch (sel.kind) {
         case 'Defer':
-          if (
-            sel.if === null ||
-            Boolean(selector.variables[sel.if])
-          ) {
+          if (sel.if === null || Boolean(selector.variables[sel.if])) {
             visit(sel);
           }
           break;

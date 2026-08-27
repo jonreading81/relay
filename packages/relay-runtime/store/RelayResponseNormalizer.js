@@ -304,6 +304,19 @@ class RelayResponseNormalizer {
             : {};
           const fieldKey = getStorageKey(selection, this._variables);
           const handleKey = getHandleStorageKey(selection, this._variables);
+          // Under `deferDeduplicatedFields` a chunk may omit the handle's
+          // underlying field because another chunk carries it. The handler is
+          // then told the field is absent — ConnectionHandler reads that as
+          // "no connection" and writes an explicit null over the handle key,
+          // discarding edges a sibling chunk delivered and turning a missing
+          // read into one that renders empty instead of suspending.
+          if (
+            this._deferDeduplicatedFields &&
+            data[fieldKey] === undefined &&
+            data[selection.alias ?? selection.name] === undefined
+          ) {
+            break;
+          }
           this._handleFieldPayloads.push({
             args,
             dataID: RelayModernRecord.getDataID(record),

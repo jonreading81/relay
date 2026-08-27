@@ -49,35 +49,40 @@ describe.each(['RelayModernEnvironment', 'MultiActorEnvironment'])(
     let error;
     let next;
 
+    const createEnvironment = (deferDeduplicatedFields?: boolean) => {
+      const fetch = (
+        _query: RequestParameters,
+        _variables: Variables,
+        _cacheConfig: CacheConfig,
+      ): RelayObservable<GraphQLResponse> => {
+        return RelayObservable.create<GraphQLResponse>(
+          (sink: Sink<GraphQLResponse>) => {
+            dataSource = sink;
+          },
+        );
+      };
+      const store = new RelayModernStore(RelayRecordSource.create());
+      const multiActorEnvironment = new MultiActorEnvironment({
+        createNetworkForActor: _actorID => RelayNetwork.create(fetch),
+        createStoreForActor: _actorID => store,
+        deferDeduplicatedFields,
+      });
+      return environmentType === 'MultiActorEnvironment'
+        ? multiActorEnvironment.forActor(getActorIdentifier('actor:1234'))
+        : new RelayModernEnvironment({
+            network: RelayNetwork.create(fetch),
+            store,
+            deferDeduplicatedFields,
+          });
+    };
+
     describe(environmentType, () => {
       beforeEach(() => {
         complete = jest.fn<[], unknown>();
         error = jest.fn<[Error], unknown>();
         next = jest.fn<[GraphQLResponse], unknown>();
         callbacks = {complete, error, next};
-        const fetch = (
-          _query: RequestParameters,
-          _variables: Variables,
-          _cacheConfig: CacheConfig,
-        ): RelayObservable<GraphQLResponse> => {
-          return RelayObservable.create<GraphQLResponse>(
-            (sink: Sink<GraphQLResponse>) => {
-              dataSource = sink;
-            },
-          );
-        };
-        const store = new RelayModernStore(RelayRecordSource.create());
-        const multiActorEnvironment = new MultiActorEnvironment({
-          createNetworkForActor: _actorID => RelayNetwork.create(fetch),
-          createStoreForActor: _actorID => store,
-        });
-        environment =
-          environmentType === 'MultiActorEnvironment'
-            ? multiActorEnvironment.forActor(getActorIdentifier('actor:1234'))
-            : new RelayModernEnvironment({
-                network: RelayNetwork.create(fetch),
-                store,
-              });
+        environment = createEnvironment();
       });
 
       it('populates the connection edges from the deferred payload', () => {
@@ -180,6 +185,120 @@ describe.each(['RelayModernEnvironment', 'MultiActorEnvironment'])(
             ],
             pageInfo: {
               endCursor: 'cursor-2',
+              hasNextPage: false,
+            },
+          },
+        });
+      });
+
+      it('keeps a connection whose edges arrive in a separate chunk from the fragment root', () => {
+        const query = graphql`
+          query RelayModernEnvironmentExecuteWithDeferInFragmentAndConnectionTestSplitQuery(
+            $id: ID!
+          ) {
+            node(id: $id) {
+              ... on User {
+                ...RelayModernEnvironmentExecuteWithDeferInFragmentAndConnectionTestSplitWrapper
+                  @dangerously_unaliased_fixme
+              }
+            }
+          }
+        `;
+        graphql`
+          fragment RelayModernEnvironmentExecuteWithDeferInFragmentAndConnectionTestSplitWrapper on User {
+            id
+            ...RelayModernEnvironmentExecuteWithDeferInFragmentAndConnectionTestSplitConnection
+              @dangerously_unaliased_fixme
+              @defer(label: "SplitConnectionFragment")
+          }
+        `;
+        const connectionFragment = graphql`
+          fragment RelayModernEnvironmentExecuteWithDeferInFragmentAndConnectionTestSplitConnection on User {
+            name
+            friends(first: 1)
+              @connection(
+                key: "RelayModernEnvironmentExecuteWithDeferInFragmentAndConnectionTestSplit__friends"
+              ) {
+              edges {
+                node {
+                  id
+                  name
+                }
+              }
+            }
+          }
+        `;
+        const operation = createOperationDescriptor(query, {id: '1'});
+        const selector = createReaderSelector(
+          connectionFragment,
+          '1',
+          {},
+          operation.request,
+        );
+        const label =
+          'RelayModernEnvironmentExecuteWithDeferInFragmentAndConnectionTestSplitWrapper$defer$SplitConnectionFragment';
+        // The server only omits an already-delivered field when the client
+        // opts into deduplicated chunks.
+        environment = createEnvironment(true);
+
+        environment.execute({operation}).subscribe(callbacks);
+        dataSource.next({
+          data: {node: {id: '1', __typename: 'User'}},
+        });
+        jest.runAllTimers();
+        next.mockClear();
+
+        // The fragment root arrives without `friends` — the field the
+        // connection's handle describes — because a sibling chunk carries it.
+        dataSource.next({
+          data: {name: 'Alice'},
+          label,
+          path: ['node'],
+        });
+
+        // The connection must be left MISSING, not written as an explicit
+        // null: a null reads as an empty list, so a consumer renders "no
+        // results" instead of waiting for the chunk that owns the edges.
+        const pending = environment.lookup(selector);
+        expect(pending.data?.friends).toBe(undefined);
+        expect(pending.isMissingData).toBe(true);
+
+        dataSource.next({
+          data: {
+            friends: {
+              edges: [
+                {
+                  cursor: 'cursor-1',
+                  node: {id: 'u2', name: 'Bob', __typename: 'User'},
+                },
+              ],
+              pageInfo: {
+                endCursor: 'cursor-1',
+                hasNextPage: false,
+                startCursor: 'cursor-1',
+                hasPreviousPage: false,
+              },
+            },
+          },
+          label,
+          path: ['node'],
+        });
+
+        expect(error.mock.calls.map(call => call[0].message)).toEqual([]);
+        expect(complete).toBeCalledTimes(0);
+        const snapshot = environment.lookup(selector);
+        expect(snapshot.isMissingData).toBe(false);
+        expect(snapshot.data).toEqual({
+          name: 'Alice',
+          friends: {
+            edges: [
+              {
+                cursor: 'cursor-1',
+                node: {__typename: 'User', id: 'u2', name: 'Bob'},
+              },
+            ],
+            pageInfo: {
+              endCursor: 'cursor-1',
               hasNextPage: false,
             },
           },
